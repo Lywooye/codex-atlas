@@ -366,7 +366,9 @@ class CodexRunner:
 
 
 class AnalysisService:
-    """One worker with durable retry state and an explicit manual pause."""
+    """Bounded workers with durable retry state and an explicit manual pause."""
+
+    MAX_PARALLELISM = 6
 
     LEASE_SECONDS = 75
     RETRY_DELAYS = (30, 120)
@@ -381,10 +383,15 @@ class AnalysisService:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._threads: dict[int, threading.Thread] = {}
+        self._jobs: dict[int, dict] = {}
         self._clients: dict[str, float] = {}
         saved = store.queue_settings()
         self._approved = saved.get("approved", False)
         self._paused = saved.get("paused", True) or not self._approved
+        self._parallelism = saved.get("parallelism", 3)
+        if type(self._parallelism) is not int or not 1 <= self._parallelism <= self.MAX_PARALLELISM:
+            self._parallelism = 3
         self._background = os.environ.get("ATLAS_BACKGROUND") == "1"
         self._cooldown_until = saved.get("cooldown_until", 0)
         self._failures = saved.get("failures", 0)
@@ -395,25 +402,47 @@ class AnalysisService:
 
     def start(self) -> None:
         with self._lock:
-            if self._thread and self._thread.is_alive():
+            alive = {slot: thread for slot, thread in self._threads.items() if thread.is_alive()}
+            if len(alive) == self.MAX_PARALLELISM:
                 return
-            recovered = self.store.recover_jobs()
-            logger.info("worker_started recovered_jobs=%s", recovered)
+            self._jobs = {slot: job for slot, job in self._jobs.items() if slot in alive}
+            recovered = self.store.recover_jobs(exclude_ids=[job["id"] for job in self._jobs.values()])
+            self._refresh_active()
+            logger.info("worker_pool_started parallelism=%s recovered_jobs=%s", self._parallelism, recovered)
             self._stop.clear()
-            self._thread = threading.Thread(target=self._run, name="atlas-analysis", daemon=True)
-            self._thread.start()
+            for slot in range(self.MAX_PARALLELISM):
+                if slot not in alive:
+                    thread = threading.Thread(target=self._run, args=(slot,), name=f"atlas-analysis-{slot+1}", daemon=True)
+                    self._threads[slot] = thread
+                    thread.start()
+            self._thread = self._threads[0]
+
+    def _refresh_active(self):
+        self._active = bool(self._jobs)
+        self._job_id = next((job["id"] for job in self._jobs.values()), None)
 
     def _save_control(self):
         self.store.save_queue_settings({"paused": self._paused, "approved": self._approved, "cooldown_until": self._cooldown_until,
-                                        "failures": self._failures, "error": self._error})
+                                        "failures": self._failures, "error": self._error,
+                                        "parallelism": self._parallelism})
+
+    def set_parallelism(self, value: int) -> None:
+        if type(value) is not int or not 1 <= value <= self.MAX_PARALLELISM:
+            raise ValueError("并行数必须是 1 至 6 的整数")
+        with self._lock:
+            self._parallelism = value
+            self._save_control()
+            logger.info("parallelism_changed limit=%s active=%s", value, len(self._jobs))
+        self._wake.set()
 
     def stop(self) -> None:
-        logger.info("worker_stop_requested job_id=%s", self._job_id)
+        logger.info("worker_stop_requested job_ids=%s", [job["id"] for job in self._jobs.copy().values()])
         self._stop.set()
         self._wake.set()
-        thread = self._thread
-        if thread and thread is not threading.current_thread():
-            thread.join(timeout=8)
+        deadline = time.monotonic() + 8
+        for thread in list(self._threads.values()):
+            if thread is not threading.current_thread():
+                thread.join(timeout=max(0, deadline-time.monotonic()))
 
     def heartbeat(self, client_id: str) -> None:
         if not isinstance(client_id, str) or not client_id or len(client_id) > 200:
@@ -460,21 +489,24 @@ class AnalysisService:
             return {"paused": self._paused, "active": self._active, "job_id": self._job_id,
                     "error": self._error, "last_success": self._last_success,
                     "clients": len(self._clients), "model": model, "effort": effort,
-                    "background": self._background, "requires_consent": not self._approved, "worker_alive": bool(self._thread and self._thread.is_alive()),
+                    "background": self._background, "requires_consent": not self._approved, "worker_alive": any(t.is_alive() for t in self._threads.values()),
+                    "parallelism": self._parallelism, "active_count": len(self._jobs),
+                    "job_ids": [job["id"] for job in self._jobs.values()],
                     "cooldown_until": self._cooldown_until if self._cooldown_until > time.time() else None}
 
-    def _run(self) -> None:
+    def _run(self, slot: int = 0) -> None:
         while not self._stop.is_set():
+            job = None
             try:
                 with self._lock:
                     self._prune_clients()
                     eligible = (not self._paused and (self._background or bool(self._clients))
-                                and time.time() >= self._cooldown_until)
-                    job = self.store.claim_job() if eligible else None
+                                and not self._stop.is_set() and time.time() >= self._cooldown_until
+                                and slot < self._parallelism and len(self._jobs) < self._parallelism)
+                    job = self.store.claim_job(exclude_thread_ids=[j["thread_id"] for j in self._jobs.values()]) if eligible else None
                     if job:
-                        self._active = True
-                        self._job_id = job["id"]
-                        self._error = None
+                        self._jobs[slot] = job
+                        self._refresh_active()
                 if not job:
                     self._wake.wait(1)
                     self._wake.clear()
@@ -491,10 +523,12 @@ class AnalysisService:
                         logger.info("job_obsolete job_id=%s", job["id"])
                         continue
                     with self._lock:
-                        self._failures = 0
-                        self._cooldown_until = 0
-                        self._error = None
-                        self._save_control()
+                        # An older in-flight success must not cancel another worker's cooldown.
+                        if time.time() >= self._cooldown_until:
+                            self._failures = 0
+                            self._cooldown_until = 0
+                            self._error = None
+                            self._save_control()
                         self._last_success = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                     logger.info("job_completed job_id=%s duration_seconds=%.1f", job["id"], time.monotonic()-started)
                 except AnalysisCancelled:
@@ -504,7 +538,8 @@ class AnalysisService:
                     attempt = job.get("attempts", 1)
                     service_error = isinstance(exc, (RuntimeError, OSError, TimeoutError))
                     with self._lock:
-                        self._error = str(exc)[:2000]
+                        error = str(exc)[:2000]
+                        self._error = error
                         self._failures += 1
                         delay = 0
                         if service_error or self._failures >= 3:
@@ -513,22 +548,24 @@ class AnalysisService:
                         self._save_control()
                     if service_error or attempt <= len(self.RETRY_DELAYS):
                         delay = max(delay, self.RETRY_DELAYS[min(attempt-1, len(self.RETRY_DELAYS)-1)])
-                        retry_at = self.store.schedule_retry(job["id"], self._error, delay)
+                        retry_at = self.store.schedule_retry(job["id"], error, delay)
                         logger.exception("job_retry job_id=%s attempt=%s retry_at=%s", job["id"], attempt, retry_at)
                     else:
-                        self.store.fail_job(job["id"], self._error)
+                        self.store.fail_job(job["id"], error)
                         logger.exception("job_failed_skipping job_id=%s attempt=%s", job["id"], attempt)
                 finally:
                     with self._lock:
-                        self._active = False
-                        self._job_id = None
+                        self._jobs.pop(slot, None)
+                        self._refresh_active()
+                    self._wake.set()
             except Exception as exc:
                 with self._lock:
                     self._error = str(exc)[:2000]
-                    self._cooldown_until = time.time() + self.INTERNAL_RETRY_DELAY
+                    self._cooldown_until = max(self._cooldown_until, time.time() + self.INTERNAL_RETRY_DELAY)
                 logger.exception("worker_error; recovering in %s seconds", self.INTERNAL_RETRY_DELAY)
                 if not self._stop.wait(self.INTERNAL_RETRY_DELAY):
                     try:
-                        self.store.recover_jobs()
+                        with self._lock:
+                            self.store.recover_jobs(exclude_ids=[j["id"] for j in self._jobs.values()])
                     except Exception:
                         logger.exception("worker_recovery_failed")

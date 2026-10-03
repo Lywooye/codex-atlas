@@ -38,6 +38,7 @@ class Action(BaseModel):
 class ModelSettings(BaseModel):
     model: str = Field(min_length=1, max_length=100)
     reasoning_effort: str = Field(min_length=1, max_length=20)
+    parallelism: int | None = Field(default=None, ge=1, le=6, strict=True)
 
 
 class Merge(BaseModel):
@@ -217,16 +218,21 @@ def create_app(db_path: Path | None = None, codex_home: Path | None = None,
     @app.get('/api/analysis/settings')
     def analysis_settings():
         if demo:
-            return {'model': 'fictional-demo', 'reasoning_effort': None, 'models': [], 'catalog_updated_at': None}
+            return {'model': 'fictional-demo', 'reasoning_effort': None, 'models': [], 'catalog_updated_at': None, 'parallelism': 3}
         try:
-            return {**read_settings(analyzer.runner), **model_catalog(history_root)}
+            return {**read_settings(analyzer.runner), **model_catalog(history_root),
+                    "parallelism": analyzer.status()["parallelism"]}
         except RuntimeError as exc:
             raise HTTPException(503, str(exc))
 
     @app.patch('/api/analysis/settings')
     def update_analysis_settings(body: ModelSettings):
         try:
-            saved = save_settings(analyzer.runner, body.model, body.reasoning_effort)
+            with analyzer._lock:
+                saved = save_settings(analyzer.runner, body.model, body.reasoning_effort)
+                if body.parallelism is not None:
+                    analyzer.set_parallelism(body.parallelism)
+                saved["parallelism"] = analyzer.status()["parallelism"]
         except RuntimeError as exc:
             raise HTTPException(503, str(exc))
         logger.info('analysis_settings_saved model=%s effort=%s effective=next_job', body.model, body.reasoning_effort)

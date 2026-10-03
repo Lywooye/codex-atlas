@@ -82,7 +82,7 @@ export default function App() {
         <section className="coverage-strip" aria-label={tr("收录与整理进度")}>
           <button className="coverage-toggle" onClick={()=>setStatusExpanded(v=>!v)} aria-expanded={statusExpanded}>
             <span className={`status-orb ${activeAnalysis?'pulsing':''}`}><Sparkles size={15}/></span>
-            <span className="coverage-label">{!status?tr("正在连接"):status.analysis.paused?tr("整理已暂停"):status.analysis.cooldown_until?tr("等待自动恢复"):activeAnalysis?tr("正在整理对话"):status.pending>0?tr("等待 AI 整理"):status.failed>0?tr("部分内容整理失败"):status.chunks>0?tr("整理已完成"):tr("尚无待整理内容")}</span>
+            <span className="coverage-label">{!status?tr("正在连接"):status.analysis.paused?tr("整理已暂停"):status.analysis.cooldown_until?tr("等待自动恢复"):activeAnalysis?tr("正在整理 {0} 批 / 上限 {1} 批", [status.analysis.active_count ?? 1, status.analysis.parallelism ?? 1]):status.pending>0?tr("等待 AI 整理"):status.failed>0?tr("部分内容整理失败"):status.chunks>0?tr("整理已完成"):tr("尚无待整理内容")}</span>
             <span className="coverage-counts">{tr("已收录 ")}<b>{status?.threads.toLocaleString(locale()) ?? '—'}</b>{tr(" 条聊天 ")}<i/>{tr("AI 已整理 ")}<b>{status?.analyzed.toLocaleString(locale()) ?? '—'}</b> / {status?.chunks.toLocaleString(locale()) ?? '—'}{tr(" 批")}</span>
             <ChevronDown size={14} className={statusExpanded?'rotated':''}/>
           </button>
@@ -120,7 +120,7 @@ export default function App() {
           {!!status.source_errors?.length&&<div className="status-error-list"><h3>{tr("读取问题详情 ")}<span>{tr("显示 ")}{Math.min(5,status.source_errors.length)}{tr(" 条")}</span></h3>{status.source_errors.slice(0,5).map((source,i)=><details className="status-error-record" key={i}><summary><TriangleAlert size={13}/><span title={source.path}>{source.path?.split('/').pop() || tr("未知来源")}</span>{!!source.parse_errors&&<small>{source.parse_errors}{tr(" 处读取异常")}</small>}<ChevronDown size={12}/></summary><code>{source.path}</code><pre>{source.error ? localizeError(source.error) : tr("发现 {0} 处读取异常，部分聊天内容可能尚未收录。", [source.parse_errors || 0])}</pre></details>)}</div>}
         </section>}
         {catalogError && <ErrorBox error={tr("无法读取项目与主题：{0}", [catalogError])} retry={reloadCatalog}/>}
-        {route.view==='projects' && !route.project && <ProjectGrid onGroup={setGrouping} projects={projects} topics={topics} loading={catalogLoading} status={status} onSelect={id=>navigate({project:id})} onSource={(id,focus)=>setSource({id,focus})} onEdit={setCorrection}/>}
+        {route.view==='projects' && !route.project && <ProjectGrid onMerged={correctionDone} onGroup={setGrouping} projects={projects} topics={topics} loading={catalogLoading} status={status} onSelect={id=>navigate({project:id})} onSource={(id,focus)=>setSource({id,focus})} onEdit={setCorrection}/>}
         {route.view==='projects' && route.project && <ProjectDetail onGroup={setGrouping} onProject={id=>navigate({project:id})} id={route.project} revision={revision} demo={!!status?.demo} onBack={()=>navigate({project:''})} onSource={(id,focus)=>setSource({id,focus})} onOpen={openThread} onEdit={setCorrection}/>}
         {route.view==='topics' && <TopicsView initialTopic={route.topic} topics={topics} projects={projects} revision={revision} loading={catalogLoading} onProject={id=>navigate({view:'projects',project:id})} onSource={(id,focus)=>setSource({id,focus})} onEdit={setCorrection}/>}
         {route.view==='history' && <HistoryView demo={!!status?.demo} revision={revision} onSource={id=>setSource({id})} onOpen={openThread}/>}
@@ -136,7 +136,7 @@ export default function App() {
 }
 
 function childrenFor(project:Project, projects:Project[]) {return project.children ?? projects.filter(item=>item.parent_id===project.id);}
-function ProjectGrid({projects,topics,loading,status,onSelect,onSource,onEdit,onGroup}:{projects:Project[];topics:Topic[];loading:boolean;status:Status|null;onSelect:(id:string)=>void;onSource:(id:string,focus?:string)=>void;onEdit:(c:Correction)=>void;onGroup:(project:Project)=>void}) {
+function ProjectGrid({projects,topics,loading,status,onSelect,onSource,onEdit,onGroup,onMerged}:{onMerged:()=>void;projects:Project[];topics:Topic[];loading:boolean;status:Status|null;onSelect:(id:string)=>void;onSource:(id:string,focus?:string)=>void;onEdit:(c:Correction)=>void;onGroup:(project:Project)=>void}) {
   const currentLocale=locale();
   const [filter,setFilter] = useState(''); const [query,setQuery]=useState(''); const [sort,setSort]=useState('recent');
   const roots=useMemo(()=>projects.filter(project=>!project.parent_id),[projects]);
@@ -144,12 +144,44 @@ function ProjectGrid({projects,topics,loading,status,onSelect,onSource,onEdit,on
     const members=[project,...childrenFor(project,projects)];
     return (!filter || members.some(member=>member.topic_ids?.includes(filter))) && (!query || members.some(member=>`${member.name} ${member.goal} ${member.summary}`.toLowerCase().includes(query.toLowerCase())));
   }).sort((a,b)=>sort==='name'?a.name.localeCompare(b.name,locale()):String(b.source_updated_at || '').localeCompare(String(a.source_updated_at || ''))),[roots,projects,filter,query,sort,currentLocale]);
+  const [selected,setSelected]=useState<string[]>([]);
+  const [menu,setMenu]=useState<{x:number;y:number}|null>(null);
+  const [merging,setMerging]=useState<string[]|null>(null);
+  const menuRef=useRef<HTMLDivElement>(null);
+  const selection=filtered.filter(p=>selected.includes(p.id));
+  useEffect(()=>{const visible=new Set(filtered.map(p=>p.id));setSelected(old=>{const next=old.filter(id=>visible.has(id));return next.length===old.length?old:next;});},[filtered]);
+  useEffect(()=>{
+    if(!menu)return;
+    menuRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
+    const outside=(e:PointerEvent)=>{if(!menuRef.current?.contains(e.target as Node))setMenu(null);};
+    const dismiss=()=>setMenu(null);
+    const keyboard=(e:KeyboardEvent)=>{if(e.key==='Escape'||e.key==='Tab')dismiss();};
+    window.addEventListener('pointerdown',outside);window.addEventListener('keydown',keyboard);
+    window.addEventListener('scroll',dismiss,true);window.addEventListener('resize',dismiss);
+    return()=>{window.removeEventListener('pointerdown',outside);window.removeEventListener('keydown',keyboard);window.removeEventListener('scroll',dismiss,true);window.removeEventListener('resize',dismiss);};
+  },[menu]);
+  const toggle=(id:string)=>{setSelected(old=>old.includes(id)?old.filter(x=>x!==id):[...old,id]);setMenu(null);};
+  const openMenu=(id:string,x:number,y:number)=>{if(!selected.includes(id))setSelected([id]);setMenu({x:Math.max(8,Math.min(x,window.innerWidth-248)),y:Math.max(8,Math.min(y,window.innerHeight-128))});};
+  const beginMerge=()=>{if(selection.length>=2){setMerging(selection.map(p=>p.id));setMenu(null);}};
   return <><div className="page-heading"><div><span className="eyebrow">{tr("看清工作的全貌")}</span><h1>{tr("项目总览")}<span className="heading-count">{roots.length}</span></h1><p>{tr("先看完整目标，再进入课程、工具与研究等具体工作分项。")}</p></div><div className="heading-note"><span className="small-line"/>{tr("主项目连接共同目标")}<br/><span>{tr("工作分项保留各自进展")}</span></div></div>
     <div className="overview-stats"><div><span>{tr("主项目")}</span><strong>{roots.length}<small>{tr("个完整目标")}</small></strong><FolderKanban size={22}/></div><div><span>{tr("连接主题")}</span><strong>{topics.length}<small>{tr("个关注方向")}</small></strong><Layers3 size={22}/></div><div><span>{tr("有待推进事项")}</span><strong>{roots.filter(p=>p.open_items?.length).length}<small>{tr("个主项目")}</small></strong><ArrowUpRight size={22}/></div></div>
     <div className="section-toolbar"><div className="section-label"><span className="dot-small"/>{tr("全部主项目 ")}<span>{filtered.length}</span></div><div className="toolbar-controls"><div className="small-search"><Search size={14}/><input aria-label={tr("筛选项目与工作分项")} placeholder={tr("项目或工作分项…")} value={query} onChange={e=>setQuery(e.target.value)}/></div><select aria-label={tr("按主题筛选项目")} value={filter} onChange={e=>setFilter(e.target.value)}><option value="">{tr("全部主题")}</option>{topics.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><select aria-label={tr("项目排序")} value={sort} onChange={e=>setSort(e.target.value)}><option value="recent">{tr("最近对话进展")}</option><option value="name">{tr("按名称")}</option></select></div></div>
-    {loading?<Loading/>:filtered.length===0?<Empty title={roots.length?tr("没有符合条件的主项目"):tr("项目正在从对话中浮现")}>{roots.length?tr("可以用主项目或工作分项的名称、目标进行筛选。"):status?.threads ? tr("已索引 {0} 条主对话。分析会识别共同目标，并在主项目内保留具体工作分项。", [status.threads]):tr("点击“检查新内容”读取本机 Codex 对话。分类依据是内容、目标与交付物；目录名称不会自动成为项目。")}</Empty>:<div className="project-grid">{filtered.map((p,i)=>{const children=childrenFor(p,projects);return <article className="project-card" key={p.id}>
-      <div className="card-top"><span className={`project-symbol symbol-${i%4}`}><FolderKanban size={20}/></span><Badge>{p.stage || tr("阶段待确认")}</Badge>{!!p.manual && <span className="manual-mark" title={tr("含人工修正")}><Pencil size={12}/></span>}<button className="icon-button card-menu" aria-label={tr("编辑 {0}", [p.name])} onClick={()=>onEdit({mode:'edit',kind:'projects',entity:p})}><MoreHorizontal size={18}/></button></div>
-      <button className="card-link" onClick={()=>onSelect(p.id)}><h2>{p.name}<ArrowUpRight size={18}/></h2><p>{p.summary || p.goal || tr("正在整理项目摘要")}</p></button>
+    <div className="project-selection-bar" aria-label={tr("批量项目操作")}>
+      <label><input type="checkbox" aria-label={tr("选择当前显示的全部项目")} checked={filtered.length>0&&selection.length===filtered.length} disabled={!filtered.length} onChange={()=>{setSelected(selection.length===filtered.length?[]:filtered.map(p=>p.id));setMenu(null);}}/>{tr("选择当前显示")}</label>
+      <span role="status">{tr("已选 {0} 个项目", [selection.length])}</span>
+      <button className="button small" disabled={selection.length<2} onClick={beginMerge}><GitMerge size={14}/>{tr("合并所选项目")}</button>
+      {selection.length>0&&<button className="text-button" onClick={()=>{setSelected([]);setMenu(null);}}>{tr("取消选择")}</button>}
+      <small>{tr("勾选卡片后，可右键合并")}</small>
+    </div>
+    {menu&&<div ref={menuRef} className="project-context-menu" role="menu" aria-label={tr("所选项目操作")} style={{left:menu.x,top:menu.y}}>
+      <span>{tr("已选 {0} 个项目", [selection.length])}</span>
+      <button role="menuitem" disabled={selection.length<2} onClick={beginMerge}><GitMerge size={15}/>{tr("合并项目…")}</button>
+      {selection.length<2&&<small>{tr("请先勾选至少两张卡片")}</small>}
+    </div>}
+    {merging&&<BatchMergeModal ids={merging} projects={projects} onClose={()=>setMerging(null)} onDone={()=>{setMerging(null);setSelected([]);onMerged();}}/>}
+    {loading?<Loading/>:filtered.length===0?<Empty title={roots.length?tr("没有符合条件的主项目"):tr("项目正在从对话中浮现")}>{roots.length?tr("可以用主项目或工作分项的名称、目标进行筛选。"):status?.threads ? tr("已索引 {0} 条主对话。分析会识别共同目标，并在主项目内保留具体工作分项。", [status.threads]):tr("点击“检查新内容”读取本机 Codex 对话。分类依据是内容、目标与交付物；目录名称不会自动成为项目。")}</Empty>:<div className="project-grid">{filtered.map((p,i)=>{const children=childrenFor(p,projects);return <article className={`project-card ${selected.includes(p.id)?'is-selected':''}`} key={p.id} onContextMenu={e=>{e.preventDefault();openMenu(p.id,e.clientX,e.clientY);}} onKeyDown={e=>{if(e.key==='ContextMenu'||(e.shiftKey&&e.key==='F10')){e.preventDefault();const r=e.currentTarget.getBoundingClientRect();openMenu(p.id,r.left+25,r.top+45);}}}>
+      <div className="card-top"><input className="project-select" type="checkbox" aria-label={tr("选择项目：{0}", [p.name])} checked={selected.includes(p.id)} onChange={()=>toggle(p.id)}/><span className={`project-symbol symbol-${i%4}`}><FolderKanban size={20}/></span><Badge>{p.stage || tr("阶段待确认")}</Badge>{!!p.manual && <span className="manual-mark" title={tr("含人工修正")}><Pencil size={12}/></span>}<button className="icon-button card-menu" aria-label={tr("编辑 {0}", [p.name])} onClick={()=>onEdit({mode:'edit',kind:'projects',entity:p})}><MoreHorizontal size={18}/></button></div>
+      <button className="card-link" onClick={e=>{if(e.metaKey||e.ctrlKey)toggle(p.id);else onSelect(p.id);}}><h2>{p.name}<ArrowUpRight size={18}/></h2><p>{p.summary || p.goal || tr("正在整理项目摘要")}</p></button>
       <div className="topic-tags">{p.topics?.slice(0,3).map(t=><span key={t.id}>{t.name}</span>)}{(p.topics?.length||0)>3 && <span>+{p.topics.length-3}</span>}</div>
       {children.length>0?<div className="project-child-preview"><span><Layers3 size={12}/>{tr("工作分项 · ")}{children.length}</span><div>{children.slice(0,4).map(child=><button key={child.id} onClick={()=>onSelect(child.id)} title={tr("查看工作分项：{0}", [child.name])}>{child.name}</button>)}{children.length>4&&<button onClick={()=>onSelect(p.id)}>{tr("另 ")}{children.length-4}{tr(" 项")}<ChevronRight size={11}/></button>}</div></div>:<button className="text-button group-card-button" onClick={()=>onGroup(p)}><Layers3 size={12}/>{tr("归入主项目")}</button>}
       <div className="card-records"><CardRecord label={tr("最近成果")} event={p.latest_progress} onSource={onSource}/><CardRecord label={tr("最近障碍记录")} event={p.latest_blocker} onSource={onSource}/>{p.pending_decisions?.length?<details className="card-record"><summary><span>{tr("待决定")}</span><p>{p.pending_decisions[0]}</p><b>{p.pending_decisions.length}</b><ChevronDown size={11}/></summary><ul>{p.pending_decisions.map((item,i)=><li key={i}>{item}</li>)}</ul></details>:<div className="card-record missing"><span>{tr("待决定")}</span><p>{tr("尚未明确")}</p></div>}</div>
@@ -157,6 +189,33 @@ function ProjectGrid({projects,topics,loading,status,onSelect,onSource,onEdit,on
     </article>;})}</div>}
     <div className="provenance-note"><ShieldCheck size={15}/><p>{tr("主项目汇集工作分项的历史，分项保留独立来源与进展。历史对话中的“完成”和“附有验证记录”分别标注，当前状态仍以实际核验为准。")}</p></div>
   </>;
+}
+
+function BatchMergeModal({ids,projects,onClose,onDone}:{ids:string[];projects:Project[];onClose:()=>void;onDone:()=>void}) {
+  const [target,setTarget]=useState(ids[0]);
+  const [busy,setBusy]=useState(false);const [error,setError]=useState('');
+  const busyRef=useRef(false);const closeRef=useRef<HTMLButtonElement>(null);
+  const close=()=>{if(!busyRef.current)onClose();};
+  useModalKeyboard(close,closeRef);
+  const items=ids.map(id=>projects.find(p=>p.id===id&&!p.parent_id)).filter((p):p is Project=>!!p);
+  const valid=items.length===ids.length&&items.length>=2&&items.some(p=>p.id===target);
+  const submit=async(e:React.FormEvent)=>{
+    e.preventDefault();if(!valid||busyRef.current)return;
+    busyRef.current=true;setBusy(true);setError('');
+    try{await post('/projects/merge',{target_id:target,source_ids:ids.filter(id=>id!==target)});onDone();}
+    catch(e){setError(errorText(e));}finally{busyRef.current=false;setBusy(false);}
+  };
+  return <div className="overlay modal-overlay" onMouseDown={e=>{if(e.target===e.currentTarget)close();}}><section className="correction-modal" role="dialog" aria-modal="true" aria-labelledby="batch-merge-title">
+    <header><div><span className="eyebrow">{tr("整理项目归属")}</span><h2 id="batch-merge-title">{tr("合并 {0} 个项目", [ids.length])}</h2></div><button className="icon-button" ref={closeRef} disabled={busy} aria-label={tr("关闭合并项目")} onClick={close}><X size={19}/></button></header>
+    <form onSubmit={submit}><div className="modal-body">
+      <p className="form-help">{tr("将所选卡片合为一个项目。请选择保留的项目名称与目标；其他项目的内容片段、历史记录和工作分项会迁入，旧名称与聊天来源继续保留。")}</p>
+      <ul className="batch-merge-list">{items.map(p=><li key={p.id}>{p.name}{!!p.child_count&&<small>{tr("含 {0} 个工作分项", [p.child_count])}</small>}</li>)}</ul>
+      {!valid&&<ErrorBox error={tr("所选项目已变化，请取消后重新选择。")}/>}
+      {error&&<ErrorBox error={error}/>}
+      <label className="form-field">{tr("合并到哪个项目")}<select value={target} disabled={busy} onChange={e=>setTarget(e.target.value)}>{items.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
+      <p className="form-help">{tr("确认后，其他所选卡片不再单独显示。同名工作分项会分别保留，后续自动分析会沿用这次合并关系。")}</p>
+    </div><footer><button type="button" className="button" disabled={busy} onClick={close}>{tr("取消")}</button><button type="submit" className="button primary" disabled={!valid||busy}>{busy?<LoaderCircle className="spin" size={15}/>:<GitMerge size={15}/>} {busy?tr('正在合并…'):tr('确认合并')}</button></footer></form>
+  </section></div>;
 }
 
 function CardRecord({label,event,onSource}:{label:string;event?:ProgressEvent|null;onSource:(id:string,focus?:string)=>void}) {if(!event)return <div className="card-record missing"><span>{label}</span><p>{tr("尚未提取到明确记录")}</p></div>;return <details className="card-record"><summary><span>{label}</span><p>{event.text}</p><time>{date(event.timestamp)}</time><ChevronDown size={11}/></summary><div className="card-record-body"><p>{event.text}</p><div><Evidence kind={event.kind}/><time>{date(event.timestamp,true)}</time></div>{event.kind==='blocked'&&<small>{tr("历史对话中的障碍记录，是否已解除需查看后续进展。")}</small>}<EventSources event={event} onSource={onSource}/></div></details>;}
@@ -283,22 +342,23 @@ function GroupingModal({project,projects,onClose,onDone}:{project:Project;projec
 }
 
 
-type AnalysisSettings = {model: string | null; reasoning_effort: string | null; catalog_updated_at?: string; models: {id:string; name:string; efforts:string[]; default_effort:string}[]};
+type AnalysisSettings = {parallelism: number; model: string | null; reasoning_effort: string | null; catalog_updated_at?: string; models: {id:string; name:string; efforts:string[]; default_effort:string}[]};
 const effortLabels: Record<string,string> = {none:'无', minimal:'最低', low:'低', medium:'中等', high:'高', xhigh:'很高', max:'最高', ultra:'Ultra'};
 function ModelSettingsModal({demo=false,onClose,onSaved}:{demo?:boolean;onClose:()=>void;onSaved:()=>void}) {
   const [settings,setSettings] = useState<AnalysisSettings | null>(null);
   const [model,setModel] = useState('');
   const [effort,setEffort] = useState('');
+  const [parallelism,setParallelism] = useState(3);
   const [error,setError] = useState('');
   const [busy,setBusy] = useState(false);
   const closeRef = useRef<HTMLButtonElement>(null);
   useModalKeyboard(onClose,closeRef);
-  const load = useCallback(async()=>{try {setError(''); const value = await api<AnalysisSettings>('/analysis/settings'); setSettings(value); setModel(value.model || ''); setEffort(value.reasoning_effort || '');} catch(e) {setError(errorText(e));}},[]);
+  const load = useCallback(async()=>{try {setError(''); const value = await api<AnalysisSettings>('/analysis/settings'); setSettings(value); setModel(value.model || ''); setEffort(value.reasoning_effort || ''); setParallelism(value.parallelism);} catch(e) {setError(errorText(e));}},[]);
   useEffect(()=>{void load();},[load]);
   const selected = settings?.models.find(item=>item.id===model);
   const valid = selected?.efforts.includes(effort);
   const selectModel = (id:string) => {setModel(id); const next=settings?.models.find(item=>item.id===id); if(next&&!next.efforts.includes(effort)) setEffort(next.default_effort);};
-  const save = async(e:React.FormEvent) => {e.preventDefault(); if(demo)return; setBusy(true); setError(''); try {await patch('/analysis/settings',{model,reasoning_effort:effort}); onSaved();} catch(e) {setError(errorText(e));} finally {setBusy(false);}};
+  const save = async(e:React.FormEvent) => {e.preventDefault(); if(demo)return; setBusy(true); setError(''); try {await patch('/analysis/settings',{model,reasoning_effort:effort,parallelism}); onSaved();} catch(e) {setError(errorText(e));} finally {setBusy(false);}};
   return <div className="overlay modal-overlay" onMouseDown={e=>{if(e.target===e.currentTarget&&!busy)onClose();}}><section className="correction-modal" role="dialog" aria-modal="true" aria-labelledby="model-settings-title">
     <header><div><span className="eyebrow">{tr("后台整理")}</span><h2 id="model-settings-title">{tr("模型设置")}</h2></div><button className="icon-button" ref={closeRef} aria-label={tr("关闭模型设置")} onClick={onClose}><X size={19}/></button></header>
     <form onSubmit={save}><div className="modal-body">
@@ -307,6 +367,8 @@ function ModelSettingsModal({demo=false,onClose,onSaved}:{demo?:boolean;onClose:
       {!settings&&!error&&<Loading label={tr("正在读取模型列表…")}/>}
       {settings&&<><label className="form-field">{tr("模型")}<select value={model} disabled={demo||busy} onChange={e=>selectModel(e.target.value)}><option value="" disabled>{tr("请选择模型")}</option>{model&&!selected&&<option value={model} disabled>{model}{tr("（当前列表中不可用）")}</option>}{settings.models.map(item=><option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
       <label className="form-field">{tr("推理强度")}<select value={effort} disabled={demo||busy||!selected} onChange={e=>setEffort(e.target.value)}><option value="" disabled>{tr("请选择强度")}</option>{effort&&!valid&&<option value={effort} disabled>{effort}{tr("（不支持）")}</option>}{selected?.efforts.map(item=><option key={item} value={item}>{tr(effortLabels[item] || item)} · {item}</option>)}</select></label>
+      <label className="form-field">{tr("同时分析的批次数")}<select value={parallelism} disabled={demo||busy} onChange={e=>setParallelism(Number(e.target.value))}>{[1,2,3,4,5,6].map(n=><option key={n} value={n}>{n===1?tr('1 · 串行'):tr('{0} · 并行', [n])}</option>)}</select></label>
+      <p className="form-help">{tr("默认 3 路。不同聊天可同时整理，同一聊天依次处理。提高并行数会更快消耗额度；降低时会等待已开始的批次完成。")}</p>
       <p className="form-help">{tr("只保存到本工具，不影响其他 Codex 对话。模型列表来自本机 Codex；推理强度越高，通常需要更多时间与额度。")}</p>
       <p className="form-help">{tr("列表更新时间：")}{date(settings.catalog_updated_at,true)}</p></>}
     </div><footer><button type="button" className="button" disabled={busy} onClick={onClose}>{tr("取消")}</button><button className="button primary" disabled={demo||busy||!valid} type="submit">{busy?<LoaderCircle size={15} className="spin"/>:<Check size={15}/>} {busy?tr("保存中…"):tr("保存，下一批生效")}</button></footer></form>

@@ -49,3 +49,17 @@ html[lang="en"] .badge{white-space:normal}
 html[lang="en"] .sidebar-caption{letter-spacing:.02em}
 @media(max-width:1100px){.topbar{flex-wrap:wrap;row-gap:10px;height:auto;min-height:72px;padding-top:12px;padding-bottom:12px}.header-search{flex:1;min-width:180px}.queue-controls{margin-left:auto}.coverage-counts{white-space:normal}}
 @media(max-width:720px){.language-picker>span{display:none}.topbar{gap:10px}.language-picker select{min-width:82px}.queue-controls{width:100%;justify-content:flex-start}.queue-controls .model-settings-button{display:inline-flex!important}.mode-notice{padding:12px}.coverage-strip .coverage-counts{display:block!important;width:100%;margin-left:0}.coverage-toggle{justify-content:flex-start;gap:8px}}
+
+/* Project selection and batch merge */
+.project-card.is-selected{border-color:#587e6b;box-shadow:0 0 0 2px #587e6b;background:#f4f8f3}
+.project-select{width:17px;height:17px;flex-shrink:0;accent-color:#436c58;cursor:pointer}
+.project-selection-bar{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:-3px 0 18px;font-size:12px;color:#526f63}
+.project-selection-bar label{display:flex;align-items:center;gap:7px;cursor:pointer}.project-selection-bar input{accent-color:#436c58}
+.project-selection-bar small{color:#74867b;font-size:11px;margin-left:auto}
+.project-context-menu{position:fixed;z-index:90;width:240px;padding:10px;border:1px solid #cedccc;border-radius:8px;background:#fff;box-shadow:0 10px 35px #18332325;color:#304d57}
+.project-context-menu>span,.project-context-menu>small{display:block;padding:5px 8px;font-size:11px;color:#74867b}
+.project-context-menu button{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:10px 8px;border-radius:4px;font-size:13px}
+.project-context-menu button:hover:not(:disabled),.project-context-menu button:focus-visible{background:#edf4e8;outline:2px solid #789c85}
+.project-context-menu button:disabled{opacity:.5;cursor:not-allowed}
+.batch-merge-list{margin:0 0 20px;padding-left:20px;color:#526f63;font-size:13px;line-height:1.8}.batch-merge-list li{padding:4px 0;overflow-wrap:anywhere}.batch-merge-list small{display:block;color:#74867b}
+@media(max-width:720px){.project-selection-bar{gap:10px;font-size:11px}.project-selection-bar small{width:100%;margin-left:0}.project-selection-bar .button{font-size:11px}}

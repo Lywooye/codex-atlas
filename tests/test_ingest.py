@@ -62,6 +62,9 @@ def test_technical_forks_legacy_and_long_content(tmp_path):
     while job:=store.claim_job():
         pieces.extend(m['text'] for m in job['messages'] if m['text'].startswith('字'))
         assert len(job['messages'])<=20 and sum(len(m['text']) for m in job['messages'])<=20000
+        # Finish this claim before requesting another batch from the same chat.
+        with store.connection() as db:
+            db.execute("UPDATE jobs SET status='done' WHERE id=?", (job['id'],))
     assert ''.join(pieces)=='字'*45000
     assert store.search('技术检查')['total']==0
 

@@ -43,9 +43,10 @@ def test_fresh_background_queue_requires_explicit_consent(isolated, monkeypatch)
     store=Store(isolated/'fresh.sqlite3')
     service=AnalysisService(store,isolated,isolated/'fictional-history')
     claims=[]
-    monkeypatch.setattr(store,'claim_job',lambda: claims.append('claim'))
+    monkeypatch.setattr(store,'claim_job',lambda **kwargs: claims.append('claim'))
     service.start()
     try:
+        service.set_parallelism(6)
         service.heartbeat('test-browser')
         assert service.status()['paused'] and service.status()['requires_consent']
         time.sleep(.08)
@@ -78,7 +79,8 @@ def test_demo_cannot_read_history_auth_or_launch_processes(isolated,monkeypatch)
         assert client.get('/api/analysis/settings').json()['model']=='fictional-demo'
         for path,body in [('/api/sync',{}),('/api/analysis',{'action':'resume'}),('/api/analysis',{'action':'retry'}),('/api/open-thread/00000000-0000-4000-8000-000000000001',{})]:
             assert client.post(path,json=body).status_code==403
-        assert client.patch('/api/analysis/settings',json={'model':'anything','reasoning_effort':'medium'}).status_code==403
+        assert client.patch('/api/analysis/settings',json={'model':'anything','reasoning_effort':'medium','parallelism':6}).status_code==403
+        assert client.post('/api/projects/merge',json={'target_id':'fictional-a','source_ids':['fictional-b']}).status_code==403
         assert client.post('/api/heartbeat',json={'client_id':'demo-browser'}).status_code==200
         assert app.state.analyzer._thread is None
 
@@ -88,3 +90,14 @@ def test_new_index_is_private_to_owner(isolated):
     if os.name=='posix':
         assert store.db_path.stat().st_mode & 0o777 == 0o600
         assert store.db_path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_cross_origin_cannot_merge_or_change_parallelism(isolated):
+    app=create_app(background=False)
+    with TestClient(app,base_url='http://127.0.0.1:8787') as client:
+        for origin in ('https://example.invalid','http://127.0.0.1:9999','null'):
+            headers={'origin':origin}
+            assert client.post('/api/projects/merge',headers=headers,json={'target_id':'fictional-a','source_ids':['fictional-b']}).status_code==403
+            assert client.patch('/api/analysis/settings',headers=headers,json={'model':'fictional','reasoning_effort':'medium','parallelism':6}).status_code==403
+        assert app.state.analyzer.status()['parallelism']==3
+        assert app.state.analyzer.status()['requires_consent']

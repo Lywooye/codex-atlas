@@ -424,12 +424,12 @@ class Store:
         if kind not in ('project','topic'):raise ValueError('Unknown entity type')
         table='projects' if kind=='project' else 'topics'
         with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
             target_id=self._resolve(db,kind,target_id)
             if kind=='project':
                 members={target_id}|{self._resolve(db,kind,s) for s in source_ids}
                 parents={db.execute('SELECT parent_id FROM projects WHERE id=?',(p,)).fetchone()[0] for p in members}
                 if len(parents)>1:raise ValueError('只能合并同一主项目下的工作分项，或同层独立项目')
-                if any(db.execute('SELECT 1 FROM projects WHERE parent_id=? AND merged_into IS NULL',(p,)).fetchone() for p in members):raise ValueError('含工作分项的主项目不能直接合并')
             for source in source_ids:
                 source=self._resolve(db,kind,source)
                 if source==target_id:continue
@@ -438,6 +438,9 @@ class Store:
                 db.execute('INSERT OR REPLACE INTO aliases VALUES(?,?,?)',(kind,row['name'].casefold().strip(),target_id))
                 db.execute('UPDATE aliases SET entity_id=? WHERE kind=? AND entity_id=?',(target_id,kind,source))
                 if kind=='project':
+                    for child in db.execute('SELECT id,manual_fields FROM projects WHERE parent_id=? AND merged_into IS NULL',(source,)).fetchall():
+                        fields=sorted(set(json.loads(child['manual_fields']))|{'parent_id'})
+                        db.execute('UPDATE projects SET parent_id=?,manual_fields=?,updated_at=? WHERE id=?',(target_id,encoded(fields),now(),child['id']))
                     db.execute('UPDATE segments SET project_id=?,manual=1 WHERE project_id=?',(target_id,source))
                     db.execute('UPDATE overrides SET project_id=? WHERE project_id=?',(target_id,source))
                     db.execute('UPDATE assignment_overrides SET project_id=? WHERE project_id=?',(target_id,source))
@@ -496,10 +499,12 @@ class Store:
                 projects.append({key:item[key] for key in ('id','name','goal','summary','stage','updated_at','source_updated_at','open_items','parent_id','parent_name','child_count')})
             return {'projects':projects,'topics':[dict(r) for r in db.execute('SELECT id,name FROM topics WHERE merged_into IS NULL ORDER BY updated_at DESC LIMIT 250')]}
 
-    def claim_job(self):
+    def claim_job(self, exclude_thread_ids=()):
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            job=db.execute("SELECT j.*,t.title AS thread_title FROM jobs j JOIN threads t ON t.id=j.thread_id WHERE j.status='pending' AND j.next_retry_at<=? AND t.technical=0 ORDER BY t.updated_at DESC,j.source_time DESC,j.source_order DESC,j.id LIMIT 1",(time.time(),)).fetchone()
+            excluded = tuple(exclude_thread_ids)
+            exclude_sql = ' AND j.thread_id NOT IN ('+','.join('?' for _ in excluded)+')' if excluded else ''
+            job=db.execute("SELECT j.*,t.title AS thread_title FROM jobs j JOIN threads t ON t.id=j.thread_id WHERE j.status='pending' AND j.next_retry_at<=? AND t.technical=0 AND NOT EXISTS (SELECT 1 FROM jobs active WHERE active.thread_id=j.thread_id AND active.status='running')"+exclude_sql+" ORDER BY t.updated_at DESC,j.source_time DESC,j.source_order DESC,j.id LIMIT 1",(time.time(),*excluded)).fetchone()
             if not job:return None
             db.execute("UPDATE jobs SET status='running',attempts=attempts+1,updated_at=?,error=NULL WHERE id=?",(now(),job['id']))
             result=dict(job);result['attempts']+=1;result['messages']=[]
@@ -598,6 +603,7 @@ class Store:
     def apply_analysis(self,job_id,result):
         if not isinstance(result,dict) or not isinstance(result.get('segments'),list):raise ValueError('Invalid analysis shape')
         with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
             job=db.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
             if not job:raise KeyError(job_id)
             if job['status'] not in ('running','pending','failed','done'):raise ValueError('Job no longer current')
@@ -658,8 +664,11 @@ class Store:
     def retry_failed(self):
         with self.connection() as db:return db.execute("UPDATE jobs SET status='pending',attempts=0,next_retry_at=0,error=NULL WHERE status='failed'").rowcount
 
-    def recover_jobs(self):
-        with self.connection() as db:return db.execute("UPDATE jobs SET status='pending' WHERE status='running'").rowcount
+    def recover_jobs(self, exclude_ids=()):
+        excluded = tuple(exclude_ids)
+        clause = ' AND id NOT IN ('+','.join('?' for _ in excluded)+')' if excluded else ''
+        with self.connection() as db:
+            return db.execute("UPDATE jobs SET status='pending' WHERE status='running'"+clause,excluded).rowcount
 
 
     def queue_settings(self):

@@ -358,12 +358,12 @@ class FakeStore:
         self.failed = []
         self.claimed = []
         self.recovered = 0
-        self.settings = {"approved": True, "paused": False}
+        self.settings = {"approved": True, "paused": False, "parallelism": 1}
 
-    def recover_jobs(self):
+    def recover_jobs(self, exclude_ids=()):
         self.recovered += 1
 
-    def claim_job(self):
+    def claim_job(self, exclude_thread_ids=()):
         if self.pending:
             job = self.pending[0]
             if job.get('next_retry_at', 0) > time.time():
@@ -598,7 +598,7 @@ def test_background_pause_and_cooldown_survive_restart(tmp_path, monkeypatch):
 def test_worker_recovers_from_queue_exception(tmp_path):
     class FlakyStore(FakeStore):
         broken = True
-        def claim_job(self):
+        def claim_job(self, exclude_thread_ids=()):
             if self.broken:
                 self.broken = False
                 raise OSError('temporary database problem')
@@ -616,3 +616,96 @@ def test_worker_recovers_from_queue_exception(tmp_path):
         assert service._thread.is_alive() and not service.status()['paused']
     finally:
         service.stop()
+
+
+class ParallelStore(FakeStore):
+    def __init__(self):
+        super().__init__()
+        self.settings = {'parallelism': 3, 'approved': True, 'paused': False}
+        self.pending = [{**sample_job(), 'id': str(i), 'thread_id': str(i)} for i in range(6)]
+
+    def claim_job(self, exclude_thread_ids=()):
+        for job in self.pending:
+            if job['thread_id'] not in exclude_thread_ids and job.get('next_retry_at', 0) <= time.time():
+                self.pending.remove(job)
+                job['attempts'] = job.get('attempts', 0)+1
+                self.claimed.append(job)
+                return job
+
+
+class ParallelRunner:
+    def __init__(self):
+        self.started = set()
+        self.releases = {str(i): threading.Event() for i in range(6)}
+        self.failures = set()
+
+    def analyze(self, job, catalog, cancel):
+        self.started.add(job['id'])
+        while not self.releases[job['id']].wait(.01):
+            if cancel.is_set():
+                raise AnalysisCancelled()
+        if job['id'] in self.failures:
+            raise RuntimeError('service rate limited')
+        return sample_result()
+
+
+def test_parallel_limit_pause_drain_and_restart_settings(tmp_path):
+    store = ParallelStore()
+    service = AnalysisService(store, tmp_path, tmp_path)
+    runner = ParallelRunner()
+    service.runner = runner
+    service.start()
+    service.heartbeat('browser')
+    try:
+        eventually(lambda: len(runner.started) == 3)
+        assert service.status()['active_count'] == 3
+        assert len(set(service.status()['job_ids'])) == 3
+        service.set_parallelism(1)
+        runner.releases['0'].set()
+        eventually(lambda: len(store.applied) == 1)
+        assert len(store.claimed) == 3  # Lowering drains existing work first.
+        service.control('pause')
+        for i in ('1', '2'):
+            runner.releases[i].set()
+        eventually(lambda: not service.status()['active'])
+        assert len(store.claimed) == 3
+        restored = AnalysisService(store, tmp_path, tmp_path)
+        assert restored.status()['parallelism'] == 1 and restored.status()['paused']
+        service.control('resume')
+        eventually(lambda: len(runner.started) == 4)
+        assert service.status()['active_count'] == 1
+        service.set_parallelism(3)
+        eventually(lambda: len(runner.started) == 6)
+        assert service.status()['active_count'] == 3
+    finally:
+        service.stop()
+    assert all(not t.is_alive() for t in service._threads.values())
+
+
+def test_parallel_success_does_not_clear_another_workers_cooldown(tmp_path):
+    store = ParallelStore()
+    service = AnalysisService(store, tmp_path, tmp_path)
+    runner = ParallelRunner()
+    runner.failures.add('0')
+    service.runner = runner
+    service.start()
+    service.heartbeat('browser')
+    try:
+        eventually(lambda: len(runner.started) == 3)
+        runner.releases['0'].set()
+        eventually(lambda: service.status()['cooldown_until'])
+        until = service.status()['cooldown_until']
+        runner.releases['1'].set()
+        eventually(lambda: len(store.applied) == 1)
+        assert service.status()['cooldown_until'] == until
+        assert len(store.claimed) == 3
+        assert not service.status()['paused']
+    finally:
+        service.stop()
+
+
+@pytest.mark.parametrize('value', [0, 7, True, 2.5, '3'])
+def test_parallelism_validation(tmp_path, value):
+    service = AnalysisService(FakeStore(), tmp_path, tmp_path)
+    with pytest.raises(ValueError):
+        service.set_parallelism(value)

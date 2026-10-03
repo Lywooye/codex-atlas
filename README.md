@@ -43,7 +43,8 @@ For a macOS service that survives closing the terminal, run `./start.command` af
 - Distinguish discussion, decisions, reported completion, verification recorded in a conversation, and retractions.
 - Search original messages and derived summaries, including short Chinese and mixed-language queries.
 - Rename, merge, split, and reassign classifications; saved manual edits take precedence over later analysis.
-- Change the analysis model, pause or resume the queue, inspect coverage, and retry failed batches.
+- Select multiple project cards and right-click to merge them. Choose which project name and goal to keep; sources, history, and work items stay linked.
+- Change the analysis model and concurrency (1–6 batches, default 3), pause or resume the queue, inspect coverage, and retry failed batches. Different chats can run concurrently; batches within one chat run sequentially. Higher concurrency consumes quota faster.
 - Switch between English and Simplified Chinese interface text.
 
 There are no inferred completion percentages. “Verified” means a source conversation contains a verification record; Atlas has not independently rerun the work.

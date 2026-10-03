@@ -69,3 +69,23 @@ def test_settings_api_does_not_resume_or_touch_active_job(setup):
         (home/'models_cache.json').write_text('invalid json')
         assert client.get('/api/analysis/settings').status_code==503
         assert client.patch('/api/analysis/settings',json={'model':'model-a','reasoning_effort':'medium'}).status_code==503
+
+
+def test_parallelism_settings_api_persists_without_resuming(setup):
+    runner, home, data = setup
+    app = create_app(data/'parallel-settings.db', home, background=False, allow_test_host=True)
+    app.state.analyzer.control('pause')
+    with TestClient(app) as client:
+        assert client.get('/api/analysis/settings').json()['parallelism'] == 3
+        payload = {'model':'model-a','reasoning_effort':'medium','parallelism':4}
+        response = client.patch('/api/analysis/settings',json=payload)
+        assert response.status_code == 200 and response.json()['parallelism'] == 4
+        assert app.state.analyzer.status()['paused']
+        for invalid in (0,7,True,2.5,'3'):
+            assert client.patch('/api/analysis/settings',json={**payload,'parallelism':invalid}).status_code == 422
+        assert client.get('/api/analysis/settings').json()['parallelism'] == 4
+        # Existing clients can still update the model without changing concurrency.
+        assert client.patch('/api/analysis/settings',json={'model':'model-b','reasoning_effort':'low'}).json()['parallelism'] == 4
+    restored = create_app(data/'parallel-settings.db',home,background=False)
+    assert restored.state.analyzer.status()['parallelism'] == 4
+    assert restored.state.analyzer.status()['paused']

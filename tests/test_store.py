@@ -420,3 +420,96 @@ def test_retry_deadline_attempts_and_manual_pause_are_durable(tmp_path):
     store.fail_job(job['id'], 'exhausted')
     store.retry_failed()
     assert store.claim_job()['attempts'] == 1
+
+
+def parallel_store(tmp_path):
+    store = Store(tmp_path/'parallel.db')
+    with store.connection() as db:
+        for thread in ('one', 'two', 'three'):
+            db.execute('INSERT INTO threads(id,title) VALUES(?,?)', (thread,thread))
+            mid = 'message-'+thread
+            db.execute("INSERT INTO messages(id,thread_id,role,text,timestamp,line_no) VALUES(?,?,'user','Fictional shared goal','2026-01-01T00:00:00Z',1)", (mid,thread))
+            for batch in range(2):
+                job = thread+str(batch)
+                db.execute("INSERT INTO jobs(id,thread_id,source_hash,created_at) VALUES(?,?,?,'2026-01-01T00:00:00Z')", (job,thread,job))
+                db.execute('INSERT INTO job_messages VALUES(?,?,?,?,?,?)', (job,mid,mid,0,21,0))
+    return store
+
+
+def test_parallel_claims_unique_and_serial_per_chat(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    store = parallel_store(tmp_path)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        claimed = [j for j in pool.map(lambda _: store.claim_job(), range(6)) if j]
+    assert len(claimed) == 3
+    assert len({j['id'] for j in claimed}) == 3
+    assert len({j['thread_id'] for j in claimed}) == 3
+    store.apply_analysis(claimed[0]['id'], result(claimed[0]))
+    assert store.claim_job(exclude_thread_ids=[claimed[0]['thread_id']]) is None
+    next_job = store.claim_job()
+    assert next_job['thread_id'] == claimed[0]['thread_id']
+    protected = [j['id'] for j in claimed[1:]]
+    assert store.recover_jobs(exclude_ids=protected) == 1
+    with store.connection() as db:
+        assert {r['id'] for r in db.execute("SELECT id FROM jobs WHERE status='running'")} == set(protected)
+
+
+def test_concurrent_results_reuse_identity_and_preserve_manual_fields(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    store = parallel_store(tmp_path)
+    jobs = [store.claim_job() for _ in range(3)]
+    barrier = threading.Barrier(3)
+    def apply(job):
+        barrier.wait(timeout=3)
+        store.apply_analysis(job['id'], result(job))
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(apply, jobs))
+    assert len(store.projects()) == len(store.topics()) == 1
+    project = store.projects()[0]
+    assert project['segment_count'] == 3
+    store.edit_entity('project', project['id'], {'name':'My project','stage':'Manual stage'})
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(apply, jobs))
+    assert len(store.projects()) == 1
+    assert store.project(project['id'])['name'] == 'My project'
+    assert store.project(project['id'])['stage'] == 'Manual stage'
+    assert store.project(project['id'])['segment_count'] == 3
+
+
+def test_merge_parent_cards_moves_children_and_preserves_provenance(tmp_path):
+    import json
+    store,home,job,second_job,first,second=hierarchy_fixture(tmp_path)
+    target=store.group_projects('保留的学习系统','长期学习目标',[first['id']])
+    source=store.group_projects('工具系统','工具建设目标',[second['id']])
+    before=store.project(source['id'])
+    merged=store.merge_entities('project',[source['id']],target['id'])
+    assert merged['name']=='保留的学习系统'
+    assert merged['goal']=='长期学习目标'
+    assert merged['child_count']==2 and merged['segment_count']==2
+    assert store.project(source['id'])['id']==target['id']
+    child=store.project(second['id'])
+    assert child['parent_id']==target['id']
+    assert {s['id'] for s in before['segments']}<={s['id'] for s in merged['segments']}
+    assert {e['id'] for e in before['events']}<={e['id'] for e in merged['events']}
+    with store.connection() as db:
+        assert 'parent_id' in json.loads(db.execute('SELECT manual_fields FROM projects WHERE id=?',(second['id'],)).fetchone()[0])
+    output=result(second_job,name=second['name'],topic='教学')
+    output['segments'][0]['project'].update(id=second['id'],parent_id=source['id'])
+    store.apply_analysis(second_job['id'],output)
+    sync(store,home)
+    assert store.project(second['id'])['parent_id']==target['id']
+    assert len([p for p in store.projects() if not p['parent_id']])==1
+
+
+def test_batch_merge_three_projects_and_invalid_batch_rolls_back(tmp_path):
+    store=parallel_store(tmp_path)
+    jobs=[store.claim_job() for _ in range(3)]
+    for index,job in enumerate(jobs):store.apply_analysis(job['id'],result(job,name=f'项目{index}'))
+    projects=store.projects();target=projects[0]
+    with pytest.raises(KeyError):store.merge_entities('project',[projects[1]['id'],'nonexistent'],target['id'])
+    assert len(store.projects())==3
+    merged=store.merge_entities('project',[p['id'] for p in projects[1:]],target['id'])
+    assert len(store.projects())==1 and merged['segment_count']==3
+    assert len(merged['threads'])==3
+    for old in projects:assert store.project(old['id'])['id']==target['id']

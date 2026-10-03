@@ -1,0 +1,36 @@
+# Private runtime state must never be published.
+data/
+.codegraph/
+.codex/
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite*
+*.jsonl
+*.log
+*.log.*
+*.pid
+*.pem
+*.key
+*.p12
+# Screenshots and exports can contain conversations or credentials.
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.zip
+*.tar
+*.gz
+# Reproducible build and test output.
+.venv/
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+__pycache__/
+.pytest_cache/
+*.pyc
+.coverage
+htmlcov/
+tests/artifacts/
+.DS_Store
